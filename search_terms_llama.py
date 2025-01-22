@@ -13,33 +13,42 @@ from openai import OpenAI
 class SearchTermDiscovery:
     def __init__(self, api_key):
         self.embeddings = HuggingFaceEmbeddings()
-        self.client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
-            api_key=api_key
-        )
 
     def get_urls_from_google(self, language, num_results=50):
-        """Get URLs from Google search using different queries."""
-        search_queries = [
-            f"{language} stories audio",
-            f"{language} audiobooks",
-            f"{language} literature",
-            f"{language} poets and poems",
-            f"{language} folk tales",
-            f"{language} novels",
-            f"{language} authors"
-        ]
+            """Get URLs from Google search using SERP API."""
+            search_queries = [
+                f"{language} stories audio",
+                f"{language} audiobooks, book and authors",
+                f"{language} literature and folk tales",
+                f"{language} poets and poems", 
+            ]
 
-        all_urls = set()
-        for query in search_queries:
-            try:
-                urls = search(query, num_results=num_results // len(search_queries), timeout=30)
-                all_urls.update(urls)
-                time.sleep(2)
-            except Exception as e:
-                print(f"Error in Google search for query '{query}': {e}")
+            api_key = "8b8948d245036a9b8d2bd8c59fef00c419bbf90b72d4d7e371d0c631c1927f9e"  
+            serp_base_url = "https://serpapi.com/search"
 
-        return list(all_urls)
+            all_urls = set()
+            for query in search_queries:
+                try:
+                    params = {
+                        "q": query,
+                        "num": num_results // len(search_queries),
+                        "api_key": api_key
+                    }
+                    response = requests.get(serp_base_url, params=params)
+                    response.raise_for_status()
+                    
+                    search_results = response.json()
+                    if 'organic_results' in search_results:
+                        urls = [result.get("link") for result in search_results["organic_results"] if result.get("link")]
+                        all_urls.update(urls)
+                    else:
+                        print(f"No results found for query: {query}")
+                    
+                    time.sleep(2)  # To prevent hitting API rate limits
+                except Exception as e:
+                    print(f"Error in SERP API request for query '{query}': {e}")
+                        
+            return list(all_urls)
 
     def extract_text_from_url(self, url):
         """Extract text content from a URL using trafilatura."""
@@ -146,58 +155,58 @@ class SearchTermDiscovery:
 
     def query_llm(self, context: str, language: str) -> str:
         """Query NVIDIA-hosted LLaMA LLM with the given context."""
+        client = OpenAI(
+          base_url = "https://integrate.api.nvidia.com/v1",
+          api_key = "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"
+        )
         messages = [
             {"role": "user", "content": f"""
-            Available Context about {language} language content:
+            Context about {language} language content:
             {context}
 
             Task: Find as many relevant YouTube-specific search terms that would help find {language} language audio content and return me 20 unique and interesting search terms.
             Be sure to:
             1. Include actual names of books, programs, or audio series if mentioned in the context
             2. Use keywords specific to {language} content and name of some person
-            3. Include traditional and cultural terms that speakers might use
-            4. Consider both modern and traditional content types
-
+            3. Include traditional and modern and cultural terms that speakers might use
             Format each term on a new line as:
             "term"
             """
             }
         ]
 
-        completion = self.client.chat.completions.create(
+        completion = client.chat.completions.create(
             model="meta/llama-3.3-70b-instruct",
             messages=messages,
             temperature=0.2,
             top_p=0.7,
             max_tokens=1024,
-            stream=False
+            stream=True
         )
 
-        result = "".join(
-            chunk.choices[0].delta.content
-            for chunk in completion
-            if chunk.choices[0].delta.content is not None
-        )
+        result = [] 
+        for chunk in completion:
+            if chunk.choices[0].delta.content is not None:
+                print(chunk.choices[0].delta.content, end="")
 
         return result
+
+
 
     def generate_search_terms(self, language, vectorstore):
         """Generate YouTube search terms using improved context retrieval and NVIDIA-hosted LLaMA."""
         print("\nGenerating search terms...")
 
         search_queries = [
-            f"{language} stories audio",
-            f"{language} audiobooks",
+            f"{language} stories audio and folk tales",
+            f"{language} audiobooks and books",
             f"{language} literature",
-            f"{language} poets and poems",
-            f"{language} folk tales",
-            f"{language} novels",
-            f"{language} authors"
+            f"{language} authors, poets and poems",
         ]
 
         all_contexts = []
         for query in search_queries:
-            retrieved_docs = vectorstore.similarity_search(query, k=4)
+            retrieved_docs = vectorstore.similarity_search(query, k=3)
             all_contexts.extend([doc.page_content for doc in retrieved_docs])
 
         seen = set()
@@ -244,7 +253,7 @@ class SearchTermDiscovery:
 
 def main():
     # Initialize with your NVIDIA API key
-    pipeline = SearchTermDiscovery(api_key="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")
+    pipeline = SearchTermDiscovery(api_key="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")
 
     language = "Punjabi"
     print(f"\nStarting search term discovery for {language}...")
