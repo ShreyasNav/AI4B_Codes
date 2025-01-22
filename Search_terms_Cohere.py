@@ -16,38 +16,42 @@ class SearchTermDiscovery:
         self.cohere_model = "command-r-08-2024"
     
     def get_urls_from_google(self, language, num_results=50):
-        """Get URLs from Google search using different queries."""
+        """Get URLs from Google search using SERP API."""
         search_queries = [
             f"{language} stories audio",
-            f"{language} audiobooks",
-            f"{language} literature",
+            f"{language} audiobooks, book and authors",
+            f"{language} literature and folk tales",
             f"{language} poets and poems",  
-            f"{language} folk tales",
-            f"{language} novels",
-            f"{language} authors"
+
         ]
 
-        # search_queries = [
-        #     f"{language} stories audio",
-        #     f"{language} audiobooks",
-        #     f"{language} literature audio",
-        #     f"{language} poetry recitation",
-        #     f"{language} traditional songs",  
-        #     f"{language} folk tales audio",
-        #     f"{language} audio content",
-        #     f"{language} authors"
-        # ]
-        
+        api_key = "8b8948d245036a9b8d2bd8c59fef00c419bbf90b72d4d7e371d0c631c1927f9e"  
+        serp_base_url = "https://serpapi.com/search"
+
         all_urls = set()
         for query in search_queries:
             try:
-                urls = search(query, num_results=num_results//len(search_queries), timeout=30)
-                all_urls.update(urls)
-                time.sleep(2)
-            except Exception as e:
-                print(f"Error in Google search for query '{query}': {e}")
+                params = {
+                    "q": query,
+                    "num": num_results // len(search_queries),
+                    "api_key": api_key
+                }
+                response = requests.get(serp_base_url, params=params)
+                response.raise_for_status()
                 
+                search_results = response.json()
+                if 'organic_results' in search_results:
+                    urls = [result.get("link") for result in search_results["organic_results"] if result.get("link")]
+                    all_urls.update(urls)
+                else:
+                    print(f"No results found for query: {query}")
+                
+                time.sleep(2)  # To prevent hitting API rate limits
+            except Exception as e:
+                print(f"Error in SERP API request for query '{query}': {e}")
+                    
         return list(all_urls)
+
 
     def extract_text_from_url(self, url):
         """Extract text content from a URL using trafilatura."""
