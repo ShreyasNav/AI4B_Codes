@@ -1,281 +1,498 @@
 import os
+os.environ["HF_TOKEN"] = ""
+os.environ["HF_DATASETS_CACHE"] = "/projects/data/ttsteam/repos/vllm"
+os.environ["HF_HOME"] = "/projects/data/ttsteam/repos/vllm"
+os.environ["TRANSFORMERS_CACHE"] = "/projects/data/ttsteam/repos/vllm"
 import requests
-from bs4 import BeautifulSoup
+import json
+from googlesearch import search
+import trafilatura
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain_community.llms import HuggingFaceHub
 import pandas as pd
 import time
-import trafilatura
+from bs4 import BeautifulSoup
+from yt_dlp import YoutubeDL
+import concurrent.futures
+import threading
+from tqdm import tqdm
+from collections import defaultdict
 
-class SearchTermDiscovery:
-    def __init__(self, huggingface_token):
+class SearchTerms:
+  def __init__(self):
+
         self.embeddings = HuggingFaceEmbeddings()
-        os.environ["HUGGINGFACEHUB_API_TOKEN"] = "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"
-        self.llm = HuggingFaceHub(repo_id="google/flan-t5-large")
+        self.data_for_context = []
+        self.output_file1name = "data_for_context.json"
+        self.search_results = []
+        self.output_file2name = "search_terms_with_source.json"
+        self.lock = threading.Lock()  
 
-    def get_urls_from_google(self, language, num_results=30):
-        """Get URLs using SERP API."""
-        search_queries = [
-            f"{language} stories audio",
-            f"{language} audiobooks",
-            f"{language} literature audio",
-            f"{language} poetry recitation"
-        ]
 
-        api_key = "8b8948d245036a9b8d2bd8c59fef00c419bbf90b72d4d7e371d0c631c1927f9e"
+  def find_urls(self, search_queries, serp_api_key, num = 5):
+
         serp_base_url = "https://serpapi.com/search"
+        blacklist_domains = ["www.facebook.com","jiosaavn.com", "spotify.com", "gaana.com", "instagram.com"]
 
-        all_urls = set()
+        all_urls_with_queries = []  # Store URLs with their originating queries
         for query in search_queries:
             try:
                 params = {
                     "q": query,
-                    "num": num_results // len(search_queries),
-                    "api_key": api_key
+                    "num": num,
+                    "api_key": serp_api_key
                 }
                 response = requests.get(serp_base_url, params=params)
                 response.raise_for_status()
-
                 search_results = response.json()
+                
                 if 'organic_results' in search_results:
-                    urls = [result.get("link") for result in search_results["organic_results"] if result.get("link")]
-                    all_urls.update(urls)
+                    urls = [
+                        result.get("link")
+                        for result in search_results["organic_results"]
+                        if result.get("link")
+                    ]
+
+                    # Filter out blacklisted domains and store with query information
+                    filtered_urls = [
+                        {"url": url, "query": query}
+                        for url in urls
+                        if not any(blacklisted in url for blacklisted in blacklist_domains)
+                    ]
+
+                    all_urls_with_queries.extend(filtered_urls)
                 else:
+
                     print(f"No results found for query: {query}")
 
-                time.sleep(2)  # To prevent hitting API rate limits
+                time.sleep(2)
             except Exception as e:
                 print(f"Error in SERP API request for query '{query}': {e}")
+        yt_links = []
+        for each in all_urls_with_queries:
+          if "www.youtube.com" in each["url"]:
+            yt_links.append({'url': each['url'],
+            'query': each['query']})
+            all_urls_with_queries.remove(each)
 
-        return list(all_urls)
+        return all_urls_with_queries, yt_links
+    
+  def get_yt_video_info(self, yt_links):
+      ydl_opts = {
+          'quiet': True,
+          'extract_flat': True,
+      }
+      with YoutubeDL(ydl_opts) as ydl:
+        for each in yt_links:
+            url = each['url']
+            info = ydl.extract_info(url, download=False)
+            if info:
+                each['title'] = info.get('title', 'Unknown')
+                each['channel'] = info.get('uploader', 'Unknown')
+      with open("yt_direct_data.json", 'w', encoding='utf-8') as f:
+          json.dump({
+              "search_terms": yt_links
+          }, f, indent=2, ensure_ascii=False)
 
-    def extract_text_from_url(self, url):
-        """Extract text content from a URL using trafilatura, with better cleaning."""
-        try:
-            downloaded = trafilatura.fetch_url(url)
-            if downloaded:
-                text = trafilatura.extract(downloaded, 
-                                        include_comments=False, 
-                                        include_tables=False)
+      print("Got direct data for",len(yt_links),"yt links")     
 
-                if text:
-                    # Clean the text
-                    cleaned_text = self.clean_text(text)
-                    return cleaned_text if cleaned_text else ""
-            return ""
-        except Exception as e:
-            print(f"Error extracting text from {url}: {e}")
-            return ""
-
-    def clean_text(self, text):
-        """Clean extracted text to remove boilerplate and keep useful content."""
-        # Split into lines and clean
-        lines = text.split('\n')
-        cleaned_lines = []
-
-        for line in lines:
-            line = line.strip()
-            # Skip useless lines
-            if any([
-                len(line) < 20,  # Too short
-                'download' in line.lower(),
-                'zip' in line.lower(),
-                'mp3' in line.lower(),
-                'mp4' in line.lower(),
-                'audio' in line.lower() and 'mb' in line.lower(),
-                'language code' in line.lower(),
-                'iso' in line.lower(),
-                'sample of' in line.lower(),
-                line.startswith('©'),
-                line.startswith('http'),
-                'privacy policy' in line.lower(),
-                'terms of use' in line.lower(),
-                'cookie' in line.lower()
-            ]):
-                continue
-
-            cleaned_lines.append(line)
-
-        # Join non-empty lines
-        cleaned_text = ' '.join(line for line in cleaned_lines if line)
-        return cleaned_text
-
-    def gather_context(self, language, num_results=30):
-        """Gather context from SERP API results."""
-        print(f"Gathering URLs for {language}...")
-        urls = self.get_urls_from_google(language, num_results)
-
-        print(f"\nFound {len(urls)} URLs. Starting text extraction...")
-        documents = []
-        for i, url in enumerate(urls, 1):
-            text = self.extract_text_from_url(url)
+  def extract_text(self, url_info):
+    try:
+        downloaded = trafilatura.fetch_url(url_info["url"])
+        if downloaded:
+            text = trafilatura.extract(downloaded,
+                                      include_comments=False,
+                                      include_tables=False)
             if text:
-                print(f"✓ Document {i}: Got {len(text)} characters from {url}")
-                documents.append({
-                    "text": text,
-                    "source": url
-                })
-            else:
-                print(f"✗ Document {i}: Failed to extract text from {url}")
+                cleaned_text = self.clean_text(text)
+                if cleaned_text:
+                    return {
+                        "text": cleaned_text,
+                        "url": url_info["url"],
+                        "query": url_info["query"]                    }
+        return None
+    except Exception as e:
+        print(f"Error extracting text from {url_info['url']}: {e}")
+        return None
 
-        print(f"\nSuccessfully extracted text from {len(documents)} documents")
-        return documents
+  def clean_text(self, text):
+    """Clean extracted text with improved filtering."""
+    lines = text.split('\n')
+    cleaned_lines = []
 
-    def process_documents(self, documents):
-        """Process documents with better filtering."""
-        if not documents:
+    for line in lines:
+        line = line.strip()
+        if any([
+            len(line) < 20,
+            'download' in line.lower(),
+            'cookie' in line.lower(),
+            'privacy policy' in line.lower(),
+            'terms of use' in line.lower(),
+            'all rights reserved' in line.lower(),
+            line.startswith('©'),
+            line.startswith('http'),
+            not any(c.isalpha() for c in line)
+        ]):
+            continue
+
+        cleaned_lines.append(line)
+
+    return ' '.join(line for line in cleaned_lines if line)
+
+  def get_context(self, text, search_queries):
+
+        if not text:
             raise ValueError("No documents to process!")
 
-        print(f"\nProcessing {len(documents)} documents...")
-
-        # Split documents into chunks
+        print(f"\nProcessing {len(text)} documents...")
+"""
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=300,
-            chunk_overlap=30,
+            chunk_size=500,
+            chunk_overlap=100,
             length_function=len,
             separators=["\n\n", "\n", ". ", " ", ""]
         )
 
-        # Prepare texts for vectorization with filtering
         texts = []
-        for doc in documents:
-
+        for doc in text:
             chunks = splitter.split_text(doc["text"])
-            # Filter chunks
-            filtered_chunks = []
-            for chunk in chunks:
-                # Skip chunks that are likely navigation or boilerplate
-                if any([
-                    'click here' in chunk.lower(),
-                    'copyright' in chunk.lower(),
-                    'all rights reserved' in chunk.lower(),
-                    'privacy policy' in chunk.lower(),
-                    'terms of service' in chunk.lower()
-                ]):
-                    continue
-                filtered_chunks.append(chunk)
+            filtered_chunks = [
+                chunk for chunk in chunks
+                if len(chunk.split()) >= 20
+                and not any(boilerplate in chunk.lower()
+                            for boilerplate in ['cookie', 'privacy', 'terms of service'])
+            ]
 
             texts.extend([{
                 "text": chunk,
-                "source": doc["source"]
+                "url": doc["url"],
+                "query": doc["query"]
             } for chunk in filtered_chunks])
 
-        print(f"\nCreated {len(texts)} meaningful text chunks...")
+        print(f"\nCreated {len(texts)} text chunks")
+"""
 
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=5000,
+            chunk_overlap=100,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+
+        # List to collect combined chunks with their associated URLs
+        combined_chunks = []
+
+        # Combine consecutive small documents until reaching 5000 characters
+        temp_text = ""
+        temp_urls = set()  # Use a set to track multiple URLs for merged chunks
+
+        for doc in text:
+            temp_text += doc["text"] + "\n"  # Append text with separator
+            temp_urls.add(doc["url"])        # Track URL
+
+            # If the combined text exceeds the desired chunk size
+            if len(temp_text) >= 5000:
+                # Split and filter the resulting chunks
+                chunks = splitter.split_text(temp_text)
+                filtered_chunks = [
+                    chunk for chunk in chunks
+                    if len(chunk.split()) >= 20
+                    and not any(boilerplate in chunk.lower()
+                                for boilerplate in ['cookie', 'privacy', 'terms of service'])
+                ]
+
+                # Store filtered chunks with corresponding URLs
+                combined_chunks.extend([
+                    {
+                        "text": chunk,
+                        "url": ", ".join(temp_urls),  # Combine URLs
+                        "query": doc["query"]
+                    } for chunk in filtered_chunks
+                ])
+
+                # Reset for the next batch of documents
+                temp_text = ""
+                temp_urls = set()
+
+        # Edge Case: Add remaining text if it never reached 5000 characters
+        if temp_text.strip():
+            combined_chunks.append({
+                "text": temp_text.strip(),
+                "url": ", ".join(temp_urls),
+                "query": doc["query"]
+            })
+
+        print("Total combined chunks:", len(combined_chunks))
+
+"""
         if not texts:
             raise ValueError("No meaningful text chunks found after filtering!")
 
-        # Create vector store
         vectorstore = FAISS.from_texts(
             [t["text"] for t in texts],
             self.embeddings,
-            metadatas=[{"source": t["source"]} for t in texts]
+            metadatas=[{"url": t["url"], "query": t["query"]} for t in texts]
         )
 
-        return vectorstore
+        all_contexts = []
+        for query in search_queries:
+            retrieved_docs = vectorstore.similarity_search(query, k=2)
+            all_contexts.extend([doc.page_content for doc in retrieved_docs])
 
-    def generate_search_terms(self, language, vectorstore):
-        """Generate YouTube search terms using RAG."""
-        print("\nGenerating search terms...")
+        seen = set()
+        unique_contexts = [x for x in all_contexts if not (x in seen or seen.add(x))]
 
-        # First, let's see what we're working with
-        sample_docs = vectorstore.similarity_search("", k=3)
-        print("\nSample of available context:")
-        for i, doc in enumerate(sample_docs, 1):
-            print(f"\nDocument {i} preview: {doc.page_content[:200]}...")
+        context = "\n\n".join(unique_contexts)
 
-        template = f"""
-        Based on the provided context about {language} language content, generate '20' specific
-        YouTube search terms that might lead to audio content.
+        for each in text:
+          each["context"] = context
 
-        Make sure to:
-        - Include actual program, book, audiobook or audio series names if mentioned in the context.
-        - Use keywords specific Dogri content.
-        - Provide terms that people are likely to use to search for Dogri audio content.
+        self.data_for_context = text
 
-        Format each term on a new line as follows:
-        "term"
+        print("Context :")
+        print(context)
+        self.context = context
+        return context
+"""
 
-        Make sure each term is actually in or about {language} language content.
+  def query_LLM1(self, context, language, num, nvidia_llama_apikey):
+
+        prompt = f"""
+        You are an expert in linguistic search optimization. Your task is to generate {num} **highly relevant and specific** YouTube search terms to find high-quality {language} language audio content. 
+
+        Context: 
+        {context}
+
+        Guidelines for Generating Search Terms:
+        Extract Specific & Unique Terms:  
+        - Identify and include **proper nouns, names of people, programs, interviews, and podcasts** directly mentioned in the context.  
+        - If no proper nouns are present, generate highly relevant terms based on the linguistic and cultural aspects of {language}.  
+
+        Ensure Linguistic & Cultural Relevance:
+        - Incorporate **traditional, modern, and culturally significant** terms used by {language} speakers.  
+        - Focus on **speech, interviews, discussions, and storytelling**—avoid generic, broad, or unrelated terms.  
+
+        Strictly Avoid:
+        - **Music-related terms**  
+        - **Overly generic words** 
+        - **Irrelevant or ambiguous terms** that don't improve search specificity.  
+
+        Output Format:  
+        - Each term should be **unique** and **enclosed in double quotes**, with **one term per line**.  
+        - Do **not** add explanations, numbering, or any extra text—only return the search terms.  
+
+        Now, generate the best {num} search terms based on the given context.
+
         """
 
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
-            return_source_documents=True  # Add this to see what context was used
+
+        API_URL = "http://localhost:8090/v1/completions"  # Standard completions endpoint
+
+        data = {
+            "model": "meta-llama/Llama-3.3-70B-Instruct",  # Ensure correct name
+            "prompt": prompt,
+            "max_tokens": 100,
+            "temperature":0.7,
+            "top_p": 0.8
+        }
+        response = requests.post(API_URL, json=data)
+        try:
+            response_text = response.json()['choices'][0]['text']
+        except:
+            print (response.json())
+            breakpoint()
+        search_terms = [
+            term.strip().strip('"')
+            for term in response_text.split('\n')
+            if term.strip() and term.strip() != "No search terms found"
+        ]
+
+        for each in self.data_for_context:
+          each["basic_search_terms"] = search_terms
+
+        with open(self.output_file1name, 'w', encoding='utf-8') as f:
+            json.dump({
+                "search_terms": self.data_for_context
+            }, f, indent=2, ensure_ascii=False)
+
+        return search_terms
+
+  def make_chunks(self, text):
+        if not text:
+            raise ValueError("No documents to process!")
+
+        print(f"\nProcessing {len(text)} documents...")
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=100,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""]
         )
 
-        result = qa_chain.invoke(template)
-        print("\nContext used for generation:", result["source_documents"])
+        processed_chunks = []
+        for doc in text:
+            chunks = splitter.split_text(doc["text"])
+            filtered_chunks = [
+                chunk for chunk in chunks
+                if len(chunk.split()) >= 20
+                and not any(boilerplate in chunk.lower()
+                           for boilerplate in ['cookie', 'privacy', 'terms of service'])
+            ]
 
-        # Split the response into lines and filter out empty ones
-        terms = [term.strip() for term in result["result"].split('\n') if term.strip()]
-        print(terms)
+            processed_chunks.extend([{
+                "text": chunk,
+                "url": doc["url"],
+                "query": doc["query"]
+            } for chunk in filtered_chunks])
 
-        return terms
+        print(f"\nCreated {len(processed_chunks)} text chunks")
 
-    def validate_terms(self, search_terms):
-        """Validate search terms by checking YouTube result count."""
-        results = []
-        for term in search_terms:
-            try:
-                print(term)
-                url = "https://www.youtube.com/results?search_query="+f"{term}"
-                response = requests.get(url)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                video_count = len(soup.find_all('div', {'class': 'style-scope ytd-video-renderer'}))
+        if not processed_chunks:
+            raise ValueError("No meaningful text chunks found after filtering")
 
-                print(f"Found {video_count} results for term: {term}")
+        return processed_chunks
 
-                results.append({
-                    'search_term': term,
-                    'result_count': video_count,
-                    'url': url
-                })
-                time.sleep(2)  # Be nice to YouTube
+  def process_chunk(self, chunk, language, API_URL, MODEL_NAME, progress_bar):
+        """Function to send request and process LLaMA output"""
+        prompt = f"""
+            Context about {language} language content:
+            {chunk['text']}
 
-            except Exception as e:
-                print(f"Error validating term '{term}': {e}")
-                continue
+            Task: Find as many relevant YouTube-specific search terms that would help find {language} language audio content and return me top few (around 5, strictly less than 7) unique and interesting search terms.
+            From given text search terms should be related to-
+            Names of {language} podcasters
+            Names of Speech and speakers in {language}
+            Names of people giving and taking interviews in {language}
+            Names of famous {language} personalities
+            1. Include actual names and proper nouns if mentioned in the text
+            2. Use keywords specific to {language} content and name of some person
+            3. Include terms that {language} speakers might use, don't include anything related to music and songs in the search terms because these are intended to get high quality {language} audio and speech for training
+            4. Don't give generic terms
+            Format each term on a new line as:
+            "term"
+            Do not do numbering of terms and dont include any text other than search terms.
+        """
 
-        if not results:
-            print("Warning: No valid results found!")
-            return pd.DataFrame(columns=['search_term', 'result_count', 'url'])
+        data = {
+            "model": MODEL_NAME,
+            "prompt": prompt,
+            "max_tokens": 100,
+            "temperature": 0.7,
+            "top_p": 0.8
+        }
 
-        return pd.DataFrame(results).sort_values('result_count', ascending=False)
+        try:
+            response = requests.post(API_URL, json=data)
+            response.raise_for_status()
+            response_text = response.json().get('choices', [{}])[0].get('text', '')
+
+            search_terms = [
+                term.strip().strip('"')
+                for term in response_text.split("\n")
+                if term.strip() and term.strip() != "No search terms found"
+            ]
+
+            results = [
+                {
+                    "search_term": term,
+                    "source_chunk": chunk["text"],
+                    "source_url2": chunk["url"],
+                    "search_query2": chunk["query"]
+                }
+                for term in search_terms
+            ]
+
+            # Update global results safely
+            with self.lock:
+                self.search_results.extend(results)
+                progress_bar.update(1)  # Update progress bar
+
+            return results
+
+        except Exception as e:
+            print(f"Error processing chunk: {e}")
+            return []
+
+  def query_LLM2(self, chunks, language):
+        API_URL = "http://localhost:8090/v1/completions"
+        MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
+
+        with tqdm(total=len(chunks), desc="Processing Chunks", unit="chunk") as progress_bar:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_chunk = {
+                    executor.submit(self.process_chunk, chunk, language, API_URL, MODEL_NAME, progress_bar): chunk
+                    for chunk in chunks
+                }
+                for future in concurrent.futures.as_completed(future_to_chunk):
+                    future.result()  # Ensure all tasks are completed
+
+        # Save results to a JSON file
+        with open(self.output_file2name, 'w', encoding='utf-8') as f:
+            json.dump({"search_terms": self.search_results}, f, indent=2, ensure_ascii=False)
+
+        return len(self.search_results)
 
 def main():
-    pipeline = SearchTermDiscovery(huggingface_token="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")
+  pipeline = SearchTerms()
+  language = "Dogri"
+  search_queries = [
+        f"{language} children story",
+        f"{language} bedtime story",
+        f"moral stories in {language}",
+        f"Stories in {language}  for kids",
+        f"{language} fable narration",
+        f"kids storytelling in {language}"
+    ] #enter the search queries as a list
 
-    language = "Punjabi"
-    print(f"\nStarting search term discovery for {language}...")
+  serp_api_key = "bd2828baec1881f952b85b33746b20020e4da76e209020d02e293cd3583a6a4f"
 
-    # Gather and process context
-    documents = pipeline.gather_context(language)
-    if not documents:
-        print("Error: No documents found!")
-        return
+  urls, yt_links = pipeline.find_urls(search_queries, serp_api_key, num = 7)
+  with open("yt_links.json", 'w', encoding='utf-8') as f:
+      json.dump({
+          "yt_links": yt_links
+      }, f, indent=2, ensure_ascii=False)
 
-    vectorstore = pipeline.process_documents(documents)
+  #pipeline.get_yt_video_info(yt_links)
 
-    # Generate and validate search terms
-    search_terms = pipeline.generate_search_terms(language, vectorstore)
-    if not search_terms:
-        print("Error: No search terms generated!")
-        return
+  text = []
+  for i, url_info in enumerate(urls, 1):
 
-    print("\nGenerated terms:", search_terms)
+      result = pipeline.extract_text(url_info)
+      if result and len(result["text"]) > 50:
+          print(f"✓ Document {i}: Got {len(result['text'])} characters from {result['url']}")
+          text.append(result)
+      else:
+          print(f"✗ Document {i}: Failed or insufficient text from {url_info['url']}")
+  print(f"\nSuccessfully extracted text from {len(text)} documents")
 
-    #ranked_terms = pipeline.validate_terms(search_terms)
+  combined_chunks = pipeline.get_context(text, search_queries)
 
-    #print("\nTop recommended YouTube search terms:")
-    #print(ranked_terms)
+  nvidia_llama_apikey = "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"
+  
+  basic_search_terms = pipeline.query_LLM1(combined_chunks, language, 35, nvidia_llama_apikey)
+  print("Number of basic_search_terms", len(basic_search_terms))
+  print(basic_search_terms)
+  
+  good_queries = search_queries + basic_search_terms 
+  good_urls, yt = pipeline.find_urls(good_queries, serp_api_key, num = 15)
+ 
+  good_text = []
+  for i, url_info in enumerate(good_urls, 1):
+      
+      result = pipeline.extract_text(url_info)
+      if result and len(result["text"]) > 50:
+          print(f"✓ Document {i}: Got {len(result['text'])} characters from {result['url']}")
+          good_text.append(result)
+      else:
+          print(f"✗ Document {i}: Failed or insufficient text from {url_info['url']}")
+  print(f"\nSuccessfully extracted text from {len(text)} documents")
 
-    # Save results
-    #ranked_terms.to_csv(f"{language}_search_terms.csv", index=False)
+  chunks = pipeline.make_chunks(good_text)
+  
+  final_search_terms = pipeline.query_LLM2(chunks, language)
+  print(final_search_terms,"search terms generated")
 
 if __name__ == "__main__":
-    main()
+  main()
